@@ -94,12 +94,21 @@ final class VitsConvTranspose1d: Module {
     @ParameterInfo(key: "weight_v") var weightV: MLXArray?
     var bias: MLXArray?
 
-    init(_ inChannels: Int, _ outChannels: Int, kernelSize: Int, stride: Int, padding: Int, bias: Bool = true) {
+    init(
+        _ inChannels: Int, _ outChannels: Int, kernelSize: Int, stride: Int, padding: Int, bias: Bool = true,
+        weightNorm: Bool = false
+    ) {
         self.stride = stride
         self.padding = padding
-        weight = MLXArray.zeros([outChannels, kernelSize, inChannels])
-        _weightV.wrappedValue = nil
-        _weightG.wrappedValue = nil
+        let shape = [outChannels, kernelSize, inChannels]
+        if weightNorm {
+            _weightV.wrappedValue = MLXArray.zeros(shape)
+            _weightG.wrappedValue = MLXArray.ones([1, 1, inChannels])
+        } else {
+            weight = MLXArray.zeros(shape)
+            _weightV.wrappedValue = nil
+            _weightG.wrappedValue = nil
+        }
         self.bias = bias ? MLXArray.zeros([outChannels]) : nil
     }
 
@@ -213,13 +222,16 @@ final class VitsHifiGanResidualBlock: Module {
     @ModuleInfo var convs1: [VitsConv1d]
     @ModuleInfo var convs2: [VitsConv1d]
 
-    init(channels: Int, kernelSize: Int, dilation: [Int], leakyReluSlope: Float) {
+    init(channels: Int, kernelSize: Int, dilation: [Int], leakyReluSlope: Float, weightNorm: Bool) {
         self.leakyReluSlope = leakyReluSlope
         _convs1.wrappedValue = dilation.map {
-            VitsConv1d(channels, channels, kernelSize: kernelSize, padding: (kernelSize * $0 - $0) / 2, dilation: $0)
+            VitsConv1d(
+                channels, channels, kernelSize: kernelSize, padding: (kernelSize * $0 - $0) / 2, dilation: $0,
+                weightNorm: weightNorm)
         }
         _convs2.wrappedValue = dilation.map { _ in
-            VitsConv1d(channels, channels, kernelSize: kernelSize, padding: (kernelSize - 1) / 2)
+            VitsConv1d(
+                channels, channels, kernelSize: kernelSize, padding: (kernelSize - 1) / 2, weightNorm: weightNorm)
         }
     }
 
@@ -248,7 +260,9 @@ final class VitsHifiGan: Module {
     @ModuleInfo(key: "conv_post") var convPost: VitsConv1d
     @ModuleInfo var cond: VitsConv1d?
 
-    init(_ config: VitsConfig) {
+    /// `weightNorm` holds the upsampling and residual layers weight-normed,
+    /// as finetune-hf-vits trains them.
+    init(_ config: VitsConfig, weightNorm: Bool = false) {
         leakyReluSlope = config.leakyReluSlope
         numKernels = config.resblockKernelSizes.count
         numUpsamples = config.upsampleRates.count
@@ -259,7 +273,7 @@ final class VitsHifiGan: Module {
             let (rate, kernel) = rateAndKernel
             return VitsConvTranspose1d(
                 initial / (1 << i), initial / (1 << (i + 1)),
-                kernelSize: kernel, stride: rate, padding: (kernel - rate) / 2)
+                kernelSize: kernel, stride: rate, padding: (kernel - rate) / 2, weightNorm: weightNorm)
         }
         var resblocks: [VitsHifiGanResidualBlock] = []
         var channels = initial
@@ -268,7 +282,7 @@ final class VitsHifiGan: Module {
             for (kernel, dilation) in zip(config.resblockKernelSizes, config.resblockDilationSizes) {
                 resblocks.append(VitsHifiGanResidualBlock(
                     channels: channels, kernelSize: kernel, dilation: dilation,
-                    leakyReluSlope: config.leakyReluSlope))
+                    leakyReluSlope: config.leakyReluSlope, weightNorm: weightNorm))
             }
         }
         _resblocks.wrappedValue = resblocks
@@ -308,11 +322,13 @@ final class VitsResidualCouplingLayer: Module {
     @ModuleInfo var wavenet: VitsWaveNet
     @ModuleInfo(key: "conv_post") var convPost: VitsConv1d
 
-    init(_ config: VitsConfig) {
+    /// `weightNorm` holds the input and output layers weight-normed, as
+    /// finetune-hf-vits trains them.
+    init(_ config: VitsConfig, weightNorm: Bool = false) {
         halfChannels = config.flowSize / 2
-        _convPre.wrappedValue = VitsConv1d(halfChannels, config.hiddenSize, kernelSize: 1)
+        _convPre.wrappedValue = VitsConv1d(halfChannels, config.hiddenSize, kernelSize: 1, weightNorm: weightNorm)
         _wavenet.wrappedValue = VitsWaveNet(config, numLayers: config.priorEncoderNumWavenetLayers)
-        _convPost.wrappedValue = VitsConv1d(config.hiddenSize, halfChannels, kernelSize: 1)
+        _convPost.wrappedValue = VitsConv1d(config.hiddenSize, halfChannels, kernelSize: 1, weightNorm: weightNorm)
     }
 
     func callAsFunction(
@@ -331,8 +347,10 @@ final class VitsResidualCouplingLayer: Module {
 final class VitsResidualCouplingBlock: Module {
     @ModuleInfo var flows: [VitsResidualCouplingLayer]
 
-    init(_ config: VitsConfig) {
-        _flows.wrappedValue = (0 ..< config.priorEncoderNumFlows).map { _ in VitsResidualCouplingLayer(config) }
+    init(_ config: VitsConfig, weightNorm: Bool = false) {
+        _flows.wrappedValue = (0 ..< config.priorEncoderNumFlows).map { _ in
+            VitsResidualCouplingLayer(config, weightNorm: weightNorm)
+        }
     }
 
     func callAsFunction(
@@ -501,21 +519,68 @@ final class VitsStochasticDurationPredictor: Module {
         _postFlows.wrappedValue = flows()
     }
 
-    /// Sampled log-durations, (batch, time, 1). `noise`, if given, replaces
-    /// the random draw: tests pass the same to both ports.
-    ///
-    /// Only the reverse direction is here; the forward one, the durations'
-    /// likelihood, is for training.
-    func sample(
-        _ inputs: MLXArray, mask: MLXArray, conditioning: MLXArray? = nil,
-        noiseScale: Float = 1, noise: MLXArray? = nil
-    ) -> MLXArray {
+    private func encode(_ inputs: MLXArray, mask: MLXArray, conditioning: MLXArray?) -> MLXArray {
         var x = convPre(stopGradient(inputs))
         if let conditioning, let cond {
             x = x + cond(stopGradient(conditioning))
         }
         x = convDDS(x, mask: mask)
-        x = convProj(x) * mask
+        return convProj(x) * mask
+    }
+
+    /// The negative log-likelihood of `durations`, (batch, time, 1), per
+    /// item: what training minimises. `noise`, if given, replaces the
+    /// random draw.
+    func negativeLogLikelihood(
+        _ inputs: MLXArray, mask: MLXArray, conditioning: MLXArray? = nil,
+        durations: MLXArray, noise: MLXArray? = nil
+    ) -> MLXArray {
+        let x = encode(inputs, mask: mask, conditioning: conditioning)
+        let log2pi = Float(log(2 * Double.pi))
+
+        var hidden = postConvPre(durations)
+        hidden = postConvDDS(hidden, mask: mask)
+        hidden = postConvProj(hidden) * mask
+        let randomPosterior = (noise ?? MLXRandom.normal([durations.dim(0), durations.dim(1), 2])) * mask
+
+        var logDeterminantPosterior = MLXArray.zeros([durations.dim(0)])
+        var latentsPosterior = randomPosterior
+        // No flip after the first flow, the affine one, as in the original
+        // VITS and finetune-hf-vits; transformers' copy flips there too,
+        // which its inference never reaches.
+        for (i, flow) in postFlows.enumerated() {
+            let (latents, logDeterminant) = flow(
+                latentsPosterior, mask: mask, conditioning: x + hidden, reverse: false)
+            latentsPosterior = i > 0 ? flipped(latents) : latents
+            logDeterminantPosterior = logDeterminantPosterior + logDeterminant!
+        }
+        let posteriorHalves = split(latentsPosterior, parts: 2, axis: -1)
+        logDeterminantPosterior = logDeterminantPosterior + sum(
+            (logSigmoid(posteriorHalves[0]) + logSigmoid(-posteriorHalves[0])) * mask, axes: [1, 2])
+        let logq = sum(-0.5 * (log2pi + randomPosterior.square()) * mask, axes: [1, 2])
+            - logDeterminantPosterior
+
+        var first = (durations - sigmoid(posteriorHalves[0])) * mask
+        first = log(maximum(first, MLXArray(Float(1e-5)))) * mask
+        var logDeterminantSum = sum(-first, axes: [1, 2])
+
+        var latents = concatenated([first, posteriorHalves[1]], axis: -1)
+        for (i, flow) in flows.enumerated() {
+            let (next, logDeterminant) = flow(latents, mask: mask, conditioning: x, reverse: false)
+            latents = i > 0 ? flipped(next) : next
+            logDeterminantSum = logDeterminantSum + logDeterminant!
+        }
+        let nll = sum(0.5 * (log2pi + latents.square()) * mask, axes: [1, 2]) - logDeterminantSum
+        return nll + logq
+    }
+
+    /// Sampled log-durations, (batch, time, 1). `noise`, if given, replaces
+    /// the random draw: tests pass the same to both ports.
+    func sample(
+        _ inputs: MLXArray, mask: MLXArray, conditioning: MLXArray? = nil,
+        noiseScale: Float = 1, noise: MLXArray? = nil
+    ) -> MLXArray {
+        let x = encode(inputs, mask: mask, conditioning: conditioning)
 
         // transformers drops one flow here.
         var reversed = Array(flows.reversed())
@@ -718,9 +783,12 @@ final class VitsEncoderLayer: Module {
 
 final class VitsEncoder: Module {
     @ModuleInfo var layers: [VitsEncoderLayer]
+    /// In training, the chance of skipping each layer in a pass.
+    var layerdrop: Float
 
     init(_ config: VitsConfig) throws {
         _layers.wrappedValue = try (0 ..< config.numHiddenLayers).map { _ in try VitsEncoderLayer(config) }
+        layerdrop = config.layerdrop
     }
 
     func callAsFunction(_ hidden: MLXArray, mask: MLXArray, attentionMask: MLXArray?) -> MLXArray {
@@ -728,6 +796,10 @@ final class VitsEncoder: Module {
         let additive = attentionMask.map { (1 - $0[0..., .newAxis, .newAxis, 0...]) * Float(-1e9) }
         var x = hidden * mask
         for layer in layers {
+            // Drawn from MLX's generator, so seeding it repeats a pass exactly.
+            if training, layerdrop > 0, MLXRandom.uniform(0 ..< 1).item(Float.self) < layerdrop {
+                continue
+            }
             x = layer(x, mask: mask, attentionMask: additive)
         }
         return x * mask

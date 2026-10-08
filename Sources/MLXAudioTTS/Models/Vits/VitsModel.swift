@@ -39,16 +39,26 @@ public final class VitsModel: Module, SpeechGenerationModel, @unchecked Sendable
     @ModuleInfo(key: "embed_speaker") var embedSpeaker: Embedding?
     @ModuleInfo(key: "posterior_encoder") var posteriorEncoder: VitsPosteriorEncoder
 
+    /// In training, the chance of skipping each text-encoder layer in a
+    /// pass (the checkpoint's, 0.1 for MMS). 0 steadies the KL loss.
+    public var layerdrop: Float {
+        get { textEncoder.encoder.layerdrop }
+        set { textEncoder.encoder.layerdrop = newValue }
+    }
+
     public var sampleRate: Int { config.samplingRate }
     public var defaultGenerationParameters: GenerateParameters { GenerateParameters() }
 
-    public init(_ config: VitsConfig, tokenizer: VitsTokenizer? = nil) throws {
+    /// `forTraining` holds weight-normed the layers finetune-hf-vits trains
+    /// that way (the decoder's upsampling and residual layers, each flow's
+    /// input and output); `sanitize(weights:)` splits plain weights for them.
+    public init(_ config: VitsConfig, tokenizer: VitsTokenizer? = nil, forTraining: Bool = false) throws {
         self.config = config
         self.tokenizer = tokenizer
         speakingRate = config.speakingRate
         _textEncoder.wrappedValue = try VitsTextEncoder(config)
-        _flow.wrappedValue = VitsResidualCouplingBlock(config)
-        _decoder.wrappedValue = VitsHifiGan(config)
+        _flow.wrappedValue = VitsResidualCouplingBlock(config, weightNorm: forTraining)
+        _decoder.wrappedValue = VitsHifiGan(config, weightNorm: forTraining)
         _durationPredictor.wrappedValue = config.useStochasticDurationPrediction
             ? VitsStochasticDurationPredictor(config) : VitsDurationPredictor(config)
         if config.numSpeakers > 1 {
@@ -215,7 +225,7 @@ public final class VitsModel: Module, SpeechGenerationModel, @unchecked Sendable
             }
             sanitized[key] = value
         }
-        return sanitized
+        return vitsSplitWeightNorm(sanitized, expected: expected)
     }
 
     // MARK: - Loading
@@ -231,10 +241,11 @@ public final class VitsModel: Module, SpeechGenerationModel, @unchecked Sendable
         return try fromModelDirectory(modelDir)
     }
 
-    public static func fromModelDirectory(_ modelDir: URL) throws -> VitsModel {
+    public static func fromModelDirectory(_ modelDir: URL, forTraining: Bool = false) throws -> VitsModel {
         let configData = try Data(contentsOf: modelDir.appendingPathComponent("config.json"))
         let config = try JSONDecoder().decode(VitsConfig.self, from: configData)
-        let model = try VitsModel(config, tokenizer: try VitsTokenizer.fromModelDirectory(modelDir))
+        let model = try VitsModel(
+            config, tokenizer: try VitsTokenizer.fromModelDirectory(modelDir), forTraining: forTraining)
 
         var weights: [String: MLXArray] = [:]
         let files = try FileManager.default.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
@@ -250,4 +261,25 @@ public final class VitsModel: Module, SpeechGenerationModel, @unchecked Sendable
         eval(model.parameters())
         return model
     }
+}
+
+/// Plain weights (`X.weight`) split into weight norm's two halves where the
+/// model holds `X.weight_v` and `X.weight_g`: `weight_v` is the weight, and
+/// `weight_g` its norm over the axes the model's `weight_g` keeps as 1. The
+/// layer then computes the same weight; this is PyTorch's `weight_norm`.
+func vitsSplitWeightNorm(
+    _ weights: [String: MLXArray], expected: [String: [Int]]
+) -> [String: MLXArray] {
+    var out = weights
+    for (key, gShape) in expected where key.hasSuffix(".weight_g") {
+        let base = String(key.dropLast(".weight_g".count))
+        guard out[key] == nil, out[base + ".weight_v"] == nil, let weight = out[base + ".weight"] else {
+            continue
+        }
+        let axes = gShape.indices.filter { gShape[$0] == 1 }
+        out[base + ".weight_v"] = weight
+        out[key] = sqrt(sum(weight * weight, axes: axes, keepDims: true))
+        out[base + ".weight"] = nil
+    }
+    return out
 }

@@ -9,6 +9,12 @@
 //    TEST_RUNNER_VITS_PARITY_FIXTURES=<dir> TEST_RUNNER_VITS_PARITY_MODEL=<dir> \
 //    xcodebuild test -scheme MLXAudio-Package -destination 'platform=macOS' \
 //      -only-testing:MLXAudioTests/VitsParityTests CODE_SIGNING_ALLOWED=NO
+//
+//  The training parity tests also need VITS_PARITY_TRAIN_MODEL, the training
+//  checkpoint the fixtures were made from (mlx-audio's `parity/setup.sh`
+//  makes it, `export_train_fixtures.py` the fixtures). The short fine-tune
+//  needs it too, with VITS_FINETUNE_DATA (clips and metadata.jsonl) and
+//  VITS_FINETUNE_OUTPUT (where the voice goes).
 
 import Foundation
 import MLX
@@ -212,6 +218,23 @@ struct VitsTests {
         }
     }
 
+    @Test func alignmentSearchIsMonotonic() {
+        // Every frame on one token, tokens in order, each used.
+        let frames = 9, tokens = 4
+        var cost = [Float](repeating: 0, count: frames * tokens)
+        for y in 0 ..< frames { for x in 0 ..< tokens { cost[y * tokens + x] = -Float(abs(y / 2 - x)) } }
+        let path = vitsMaximumPath(cost, shape: (1, frames, tokens), frameLengths: [frames], textLengths: [tokens])
+        var last = 0
+        for y in 0 ..< frames {
+            let row = Array(path[(y * tokens) ..< ((y + 1) * tokens)])
+            #expect(row.reduce(0, +) == 1)
+            let x = row.firstIndex(of: 1)!
+            #expect(x >= last && x <= last + 1)
+            last = x
+        }
+        #expect(last == tokens - 1)
+    }
+
     @Test func factoryKnowsMMSVoices() {
         #expect(TTS.resolveModelType(modelRepo: "facebook/mms-tts-blt") == "vits")
         #expect(TTS.resolveModelType(modelRepo: "x/y", modelType: "vits") == "vits")
@@ -314,5 +337,264 @@ struct VitsParityTests {
             text: "té pang 'chạu", voice: nil, refAudio: nil, refText: nil, language: nil)
         #expect(audio.ndim == 1 && audio.dim(0) > model.sampleRate / 4)
         #expect(abs(audio).max().item(Float.self) > 0.01)
+    }
+}
+
+// MARK: - Training parity with the Python port
+
+private let trainFixtures = ProcessInfo.processInfo.environment["VITS_PARITY_FIXTURES"]
+private let trainModel = ProcessInfo.processInfo.environment["VITS_PARITY_TRAIN_MODEL"]
+
+/// One training step against fixtures from mlx-audio's
+/// `vits/parity/export_train_fixtures.py`. VITS_PARITY_TRAIN_MODEL names
+/// the training checkpoint it used (with the discriminator).
+@Suite(
+    "VITS training parity with mlx-audio's Python port",
+    .serialized,
+    .enabled(
+        if: trainFixtures != nil && trainModel != nil, "set VITS_PARITY_FIXTURES and VITS_PARITY_TRAIN_MODEL")
+)
+struct VitsTrainingParityTests {
+    let trainer: VitsTrainer
+    let fixtures: [String: MLXArray]
+    let batch: VitsTrainingBatch
+    let noise: VitsTrainingNoise
+
+    init() throws {
+        let (model, discriminator) = try VitsModel.loadForTraining(URL(fileURLWithPath: trainModel!))
+        // Dropout and layer drop off, as the fixtures were made.
+        model.train(false)
+        discriminator.train(false)
+        var config = VitsTrainingConfig()
+        config.batchSize = 2
+        trainer = VitsTrainer(model: model, discriminator: discriminator, config: config)
+        let f = try loadArrays(
+            url: URL(fileURLWithPath: trainFixtures!).appendingPathComponent("vits_train_fixtures.safetensors"))
+        fixtures = f
+        batch = VitsTrainingBatch(
+            inputIds: f["batch.input_ids"]!, attentionMask: f["batch.attention_mask"]!,
+            labels: f["batch.labels"]!, labelsMask: f["batch.labels_attention_mask"]!,
+            mel: f["batch.mel"]!, waveform: f["batch.waveform"]!)
+        noise = VitsTrainingNoise(
+            posterior: f["noise.posterior_noise"]!, duration: f["noise.duration_noise"]!,
+            sliceStarts: f["noise.slice_starts"]!)
+    }
+
+    /// The relative error, |a - b| / |b|, over the whole tensor.
+    private func relative(_ a: MLXArray, _ b: MLXArray) -> Float {
+        let a = a.asType(.float32)
+        let b = b.asType(.float32)
+        return (sqrt(sum((a - b).square())) / (sqrt(sum(b.square())) + 1e-30)).item(Float.self)
+    }
+
+    private func check(_ name: String, _ actual: MLXArray, _ expected: MLXArray, within tolerance: Float) {
+        #expect(actual.shape == expected.shape, "\(name): shape \(actual.shape) vs \(expected.shape)")
+        guard actual.shape == expected.shape else { return }
+        let error = relative(actual, expected)
+        print("VITS training parity  \(name.padding(toLength: 30, withPad: " ", startingAt: 0)) rel \(error)")
+        #expect(error <= tolerance, "\(name): \(error) > \(tolerance)")
+    }
+
+    @Test func spectrogramMatches() {
+        let (magnitudes, mel) = trainer.spectrogram(batch.waveform[0 ..< 1])
+        check("magnitudes", magnitudes, fixtures["spectrogram.magnitudes"]!, within: 1e-5)
+        check("log-mel", mel, fixtures["spectrogram.mel"]!, within: 1e-5)
+    }
+
+    @Test func forwardMatches() {
+        let out = vitsTrainingForward(
+            trainer.model, batch: batch, segmentFrames: trainer.segmentFrames, noise: noise)
+        check("alignment", out.attention, fixtures["forward.attn"]!, within: 0)
+        check("log duration", out.logDuration, fixtures["forward.log_duration"]!, within: 1e-4)
+        check("prior latents", out.priorLatents, fixtures["forward.prior_latents"]!, within: 1e-4)
+        check("prior means", out.priorMeans, fixtures["forward.prior_means"]!, within: 1e-4)
+        check("prior log variances", out.priorLogVariances, fixtures["forward.prior_log_variances"]!, within: 1e-4)
+        check(
+            "posterior log variances", out.posteriorLogVariances,
+            fixtures["forward.posterior_log_variances"]!, within: 1e-4)
+        check("waveform slice", out.waveform, fixtures["forward.waveform"]!, within: 1e-3)
+    }
+
+    @Test func lossesAndGradientsMatch() {
+        let out = vitsTrainingForward(
+            trainer.model, batch: batch, segmentFrames: trainer.segmentFrames, noise: noise)
+        let (_, waveTarget) = trainer.targets(batch, out)
+        let (disc, discGrads) = trainer.discriminatorGradients(fake: stopGradient(out.waveform), real: waveTarget)
+        check("loss disc", disc[1], fixtures["loss.disc"]!, within: 1e-4)
+        check("loss real disc", disc[2], fixtures["loss.real_disc"]!, within: 1e-4)
+        check("loss fake disc", disc[3], fixtures["loss.fake_disc"]!, within: 1e-4)
+
+        let (gen, genGrads) = trainer.generatorGradients(batch, noise)
+        for (i, name) in ["total", "duration", "mel", "kl", "fmaps", "gen"].enumerated() {
+            check("loss \(name)", gen[i], fixtures["loss.\(name)"]!, within: 1e-4)
+        }
+        func norm(_ g: ModuleParameters) -> MLXArray {
+            sqrt(g.flattened().map { $0.1.square().sum() }.reduce(MLXArray(Float(0)), +))
+        }
+        check("discriminator grad norm", norm(discGrads), fixtures["grad_norm.disc"]!, within: 1e-4)
+        // The decoder and posterior encoder's gradients come back through
+        // the decoder, whose leaky ReLUs and the losses' `abs` amplify
+        // rounding: an input 1e-7 different moves them by about 0.5% (see
+        // the next test). Everything else matches to rounding.
+        check("generator grad norm", norm(genGrads), fixtures["grad_norm.gen"]!, within: 5e-3)
+        for (key, g) in genGrads.flattened() {
+            let expected = fixtures["gen_grad_norm.\(key)"]!.item(Float.self)
+            guard expected > 1e-6 else { continue }  // e.g. key biases, zero but for rounding
+            let error = abs(sqrt(g.square().sum()).item(Float.self) - expected) / expected
+            let sensitive = key.hasPrefix("decoder.") || key.hasPrefix("posterior_encoder.")
+            #expect(error <= (sensitive ? 3e-2 : 1e-4), "gradient of \(key): \(error)")
+        }
+    }
+
+    @Test func audioGradientsMatch() {
+        let out = vitsTrainingForward(
+            trainer.model, batch: batch, segmentFrames: trainer.segmentFrames, noise: noise)
+        let (melTarget, waveTarget) = trainer.targets(batch, out)
+        let gMel = grad({ (w: MLXArray) in
+            mean(abs(melTarget - trainer.spectrogram(w[0..., 0..., 0]).mel))
+        })(out.waveform)
+        check("audio gradient, mel loss", gMel, fixtures["grad_wave.mel"]!, within: 1e-3)
+        let gAdversarial = grad({ (w: MLXArray) in
+            let (_, fmapsTarget) = trainer.discriminator(waveTarget)
+            let (generated, fmapsGenerated) = trainer.discriminator(w)
+            return vitsFeatureLoss(real: fmapsTarget, generated: fmapsGenerated) + vitsGeneratorLoss(generated)
+        })(out.waveform)
+        check("audio gradient, adversarial", gAdversarial, fixtures["grad_wave.adversarial"]!, within: 2e-3)
+    }
+
+    /// Given Python's decoder input and its gradient on the audio, the
+    /// decoder's backward pass gives Python's gradients to rounding. Its own
+    /// input, 1e-7 off Python's, moves them by about 0.5%: that, not the
+    /// port, is the gap the other tests allow.
+    @Test func decoderBackwardMatchesGivenTheSameInputs() {
+        let model = trainer.model
+        let labelsMask = batch.labelsMask[0..., 0..., .newAxis]
+        let (latents, _, _) = model.posteriorEncoder(batch.labels, mask: labelsMask, noise: noise.posterior)
+        let ownInput = vitsSliceSegments(latents, starts: noise.sliceStarts, size: trainer.segmentFrames)
+        let input = fixtures["decoder.input"]!
+        check("decoder input", ownInput, input, within: 1e-6)
+        let c = trainer.config
+        let cotangent = c.weightMel * fixtures["grad_wave.mel"]! + fixtures["grad_wave.adversarial"]!
+        let vg = valueAndGrad(model: model.decoder) { (decoder: VitsHifiGan, _: Int) in
+            [sum(decoder(input) * cotangent)]
+        }
+        let (_, grads) = vg(model.decoder, 0)
+        var worst: Float = 0
+        for (key, g) in grads.flattened() {
+            let expected = fixtures["gen_grad_norm.decoder.\(key)"]!.item(Float.self)
+            let actual = sqrt(g.square().sum()).item(Float.self)
+            worst = max(worst, abs(actual - expected) / expected)
+        }
+        print("VITS training parity  decoder backward, Python's inputs: worst rel \(worst)")
+        #expect(worst < 1e-4)
+    }
+
+    @Test func oneStepMatches() {
+        // Copies: the optimiser updates the model's arrays in place.
+        let before = Dictionary(uniqueKeysWithValues: trainer.model.parameters().flattened().map { ($0.0, $0.1 * 1) })
+        eval(Array(before.values))
+        trainer.setEpoch(0)
+        let losses = trainer.step(batch, noise: noise)
+        let after = Dictionary(uniqueKeysWithValues: trainer.model.parameters().flattened())
+
+        let expected: [(String, Float)] = [
+            ("duration", losses.duration), ("mel", losses.mel), ("kl", losses.kl), ("fmaps", losses.fmaps),
+            ("gen", losses.gen), ("disc", losses.disc),
+        ]
+        for (name, value) in expected {
+            check("step loss \(name)", MLXArray(value), fixtures["step.loss.\(name)"]!, within: 1e-4)
+        }
+        // Adam's first step is about the learning rate times each
+        // gradient's sign, so rounding flips a few tiny gradients' updates:
+        // compared as updates, not weights.
+        var updateSquares = MLXArray(Float(0))
+        for (key, value) in after {
+            updateSquares = updateSquares + (value - before[key]!).square().sum()
+        }
+        check("update norm", sqrt(updateSquares), fixtures["step.update_norm"]!, within: 1e-3)
+        for key in [
+            "text_encoder.encoder.layers.0.attention.q_proj.weight",
+            "duration_predictor.flows.1.conv_proj.weight",
+            "flow.flows.0.conv_pre.weight_v",
+            "decoder.upsampler.0.weight_v",
+            "decoder.conv_post.weight",
+        ] {
+            // The decoder's gradients carry the rounding above, and Adam's
+            // first step turns small differences in tiny gradients into
+            // whole steps.
+            let tolerance: Float = key.hasPrefix("decoder.") ? 0.2 : 1e-3
+            check("update \(key)", after[key]! - before[key]!, fixtures["step.\(key)"]! - before[key]!, within: tolerance)
+        }
+    }
+}
+
+// MARK: - A short fine-tune
+
+private let fineTuneData = ProcessInfo.processInfo.environment["VITS_FINETUNE_DATA"]
+private let fineTuneOutput = ProcessInfo.processInfo.environment["VITS_FINETUNE_OUTPUT"]
+
+/// A short fine-tune, saved for checking outside: VITS_PARITY_TRAIN_MODEL
+/// is the training checkpoint, VITS_FINETUNE_DATA a folder of clips and
+/// `metadata.jsonl`, VITS_FINETUNE_OUTPUT where the voice goes. Read it
+/// back with mlx-audio's `vits/parity/asr_check.py --model <output>`.
+@Suite(
+    "VITS fine-tune",
+    .serialized,
+    .enabled(
+        if: trainModel != nil && fineTuneData != nil && fineTuneOutput != nil,
+        "set VITS_PARITY_TRAIN_MODEL, VITS_FINETUNE_DATA and VITS_FINETUNE_OUTPUT")
+)
+struct VitsFineTuneTests {
+    @Test func fifteenStepsTrainAndSave() throws {
+        let source = URL(fileURLWithPath: trainModel!)
+        let (model, discriminator) = try VitsModel.loadForTraining(source)
+        var config = VitsTrainingConfig()
+        config.batchSize = 8
+        config.epochs = 3
+        let trainer = VitsTrainer(model: model, discriminator: discriminator, config: config)
+        MLXRandom.seed(config.seed)
+        let clips = try trainer.loadClips(folder: URL(fileURLWithPath: fineTuneData!))
+        #expect(clips.count >= 8)
+
+        let start = Date()
+        var steps = 0
+        GPU.resetPeakMemory()
+        trainer.train(clips, maxSteps: 15) { epoch, step, losses in
+            steps = step
+            print(String(
+                format: "VITS fine-tune  epoch %d step %d  total %.3f  mel %.3f  kl %.3f  disc %.3f  (%.0fs)",
+                epoch, step, losses.total, losses.mel, losses.kl, losses.disc, Date().timeIntervalSince(start)))
+            #expect(losses.total.isFinite && losses.disc.isFinite)
+            return true
+        }
+        let seconds = Date().timeIntervalSince(start)
+        print(String(
+            format: "VITS fine-tune  %d steps in %.1f s, peak %.2f GB", steps, seconds,
+            Double(Memory.peakMemory) / 1_073_741_824))
+        #expect(steps == 15)
+
+        let output = URL(fileURLWithPath: fineTuneOutput!)
+        try model.saveTrained(from: source, to: output)
+        // It loads back as a voice, and speaks.
+        let voice = try VitsModel.fromModelDirectory(output)
+        let (waveform, lengths) = voice(
+            MLXArray(try voice.tokenizer!.encode("té pang 'chạu").map(Int32.init)).reshaped(1, -1))
+        #expect(lengths[0].item(Int.self) > 0)
+        #expect(abs(waveform).max().item(Float.self) > 0.01)
+    }
+}
+
+@Suite("VITS config JSON")
+struct VitsJSONTests {
+    @Test func floatsStayFloats() throws {
+        let object = try JSONSerialization.jsonObject(
+            with: Data(#"{"b": 5.0, "a": [1, 2.5, true], "c": "x/é", "d": null, "e": 1e-05}"#.utf8))
+        let text = vitsJSON(object)
+        #expect(text.contains("\"b\": 5.0"))
+        #expect(text.contains("1,") && text.contains("2.5") && text.contains("true"))
+        #expect(text.contains("\"c\": \"x/é\""))
+        #expect(text.contains("\"d\": null"))
+        #expect(text.contains("1e-05"))
+        #expect(text.firstRange(of: "\"a\"")!.lowerBound < text.firstRange(of: "\"b\"")!.lowerBound)
     }
 }

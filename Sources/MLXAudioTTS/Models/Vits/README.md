@@ -32,6 +32,41 @@ will read it and the characters it dropped, so check a voice's vocabulary agains
 text before trusting it. Voices whose config asks for romanised (`is_uroman`) or
 phonemised text need that done first.
 
+## Fine-tuning
+
+A port of the Python port's trainer, itself
+[finetune-hf-vits](https://github.com/ylacombe/finetune-hf-vits) (MIT) step for step:
+the same losses and weights, discriminator then generator, AdamW with PyTorch's
+defaults, the learning rate decayed once an epoch. It needs a checkpoint carrying the
+discriminator, as finetune-hf-vits's `convert_original_discriminator_checkpoint.py`
+makes (it needs PyTorch, once per language).
+
+```swift
+let (model, discriminator) = try VitsModel.loadForTraining(checkpoint)
+let trainer = VitsTrainer(model: model, discriminator: discriminator, config: VitsTrainingConfig())
+let clips = try trainer.loadClips(folder: data)  // clips and a metadata.jsonl of {"file_name", "text"}
+trainer.train(clips) { epoch, step, losses in print(step, losses.total); return true }
+try model.saveTrained(from: checkpoint, to: output)
+```
+
+- `trainer.clip(name:audio:text:)` makes a clip from audio already in hand.
+- `saveTrained` writes a plain transformers checkpoint (weight norm folded, no
+  discriminator): it loads here, in the Python port, and in transformers 4.46 and 5.19.
+- One step, against the Python port on the same batch and noise, on `blt`'s training
+  checkpoint: every loss within 3e-6, the alignment identical, and the gradients of the
+  text encoder, duration predictor and flow within 1e-5. The decoder's and posterior
+  encoder's gradients differ by up to 1.6%: given the Python port's exact input, the
+  decoder's match within 1.3e-6, and its own input, 1e-7 off, moves them by 0.5%. That
+  is rounding amplified by the decoder's leaky ReLUs and the losses' `abs`, as between
+  the Python port and PyTorch.
+- 15 steps at batch 8 on 40 clips the stock voice made (M2 Max, a debug build): about
+  3.3 s a step, 7.4 GB at MLX's peak. The voice reads back at 1.8% character error with
+  MMS's Tai Dam recogniser, as before training.
+- Weight norm is part of how a model is built here (`forTraining: true`), not switched
+  on afterwards: MLX Swift modules can't change their parameters once made.
+- Layer drop (0.1 in MMS checkpoints) makes the KL loss spike now and then, in every
+  port; `model.layerdrop = 0` stops it.
+
 ## Notes
 
 - Ported from [mlx-audio](https://github.com/Blaizzy/mlx-audio)'s Python `vits` model,
@@ -45,4 +80,3 @@ phonemised text need that done first.
 - In a padded batch, items shorter than the longest end slightly differently than
   alone, since the decoder's convolutions see their biases in the padding. transformers
   behaves the same way.
-- Speaking only, for now. Fine-tuning exists in the Python port.
