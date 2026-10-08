@@ -224,6 +224,13 @@ public enum TTS {
                 pretrained: { try await IndexTTSModel.fromPretrained($0, cache: $1) },
                 local: { modelDir, _ in try await IndexTTSModel.fromModelDirectory(modelDir) }
             )
+        case "vits", "mms_tts":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await VitsModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try VitsModel.fromModelDirectory(modelDir) }
+            )
         case "spark", "spark_tts":
             return try await load(
                 source,
@@ -347,6 +354,9 @@ public enum TTS {
         }
         if lower.contains("omnivoice") {
             return "omnivoice"
+        }
+        if lower.contains("mms-tts") || lower.contains("mms_tts") {
+            return "vits"
         }
         if lower.contains("indextts") || lower.contains("index-tts") || lower.contains("index_tts") {
             return "indextts"
