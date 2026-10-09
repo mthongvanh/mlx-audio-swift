@@ -233,8 +233,10 @@ final class VitsPeriodDiscriminator: VitsSubDiscriminator {
 }
 
 /// The discriminator's settings in a training checkpoint's `config.json`.
+/// Its defaults are finetune-hf-vits's, which are Meta's for every MMS
+/// voice.
 public struct VitsDiscriminatorConfig: Decodable, Sendable {
-    public var scaleChannels: [Int]?
+    public var scaleChannels: [Int]? = [1, 16, 64, 256, 1024]
     public var periods: [Int] = [2, 3, 5, 7, 11]
     public var periodChannels: [Int] = [1, 32, 128, 512, 1024]
     public var kernelSize: Int = 5
@@ -252,7 +254,7 @@ public struct VitsDiscriminatorConfig: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        scaleChannels = try c.decodeIfPresent([Int].self, forKey: .scaleChannels)
+        scaleChannels = try c.decodeIfPresent([Int].self, forKey: .scaleChannels) ?? scaleChannels
         periods = try c.decodeIfPresent([Int].self, forKey: .periods) ?? periods
         periodChannels = try c.decodeIfPresent([Int].self, forKey: .periodChannels) ?? periodChannels
         kernelSize = try c.decodeIfPresent(Int.self, forKey: .kernelSize) ?? kernelSize
@@ -719,19 +721,29 @@ public extension VitsTrainer {
             labelsMask: labelsMask, mel: mel, waveform: waveform)
     }
 
+    /// The steps in an epoch of `clips` clips.
+    func stepsPerEpoch(_ clips: Int) -> Int {
+        (clips + config.batchSize - 1) / config.batchSize
+    }
+
     /// Trains on `clips` for the config's epochs, shuffled each epoch, and
-    /// reports each step. Stops after `maxSteps` if given, or when
-    /// `onStep` returns false.
+    /// reports each step. Stops after step `maxSteps` if given, or when
+    /// `onStep` returns false. `startingAt` carries on a run saved after
+    /// that many steps, from its epoch and with the learning rate there.
     func train(
-        _ clips: [VitsTrainingClip], maxSteps: Int? = nil,
+        _ clips: [VitsTrainingClip], maxSteps: Int? = nil, startingAt start: Int = 0,
         onStep: (_ epoch: Int, _ step: Int, _ losses: VitsTrainingLosses) -> Bool = { _, _, _ in true }
     ) {
-        var step = 0
-        for epoch in 0 ..< config.epochs {
+        let perEpoch = stepsPerEpoch(clips.count)
+        guard perEpoch > 0 else { return }
+        var step = start
+        for epoch in (start / perEpoch) ..< config.epochs {
             setEpoch(epoch)
             let order = clips.indices.shuffled()
-            for start in stride(from: 0, to: order.count, by: config.batchSize) {
-                let batch = Self.collate(order[start ..< min(start + config.batchSize, order.count)].map { clips[$0] })
+            let first = epoch == start / perEpoch ? start % perEpoch : 0
+            for batchIndex in first ..< perEpoch {
+                let from = batchIndex * config.batchSize
+                let batch = Self.collate(order[from ..< min(from + config.batchSize, order.count)].map { clips[$0] })
                 let losses = self.step(batch)
                 step += 1
                 if !onStep(epoch, step, losses) { return }
@@ -739,11 +751,139 @@ public extension VitsTrainer {
             }
         }
     }
+
+    /// The run so far, after `step` steps, to carry on from: the generator
+    /// and discriminator as they are, weight norm kept, in transformers'
+    /// names and layout, with the source's config and tokenizer, as
+    /// `loadForTraining` reads them, and the step in `trainer_state.json`
+    /// (`checkpointStep`). The optimisers' state isn't kept, so a run
+    /// carried on starts them afresh. The folder is replaced whole, so a
+    /// run stopped while saving keeps the last.
+    func saveCheckpoint(from source: URL, to output: URL, step: Int) throws {
+        let fm = FileManager.default
+        let partial = output.deletingLastPathComponent()
+            .appendingPathComponent(".\(output.lastPathComponent).partial")
+        try? fm.removeItem(at: partial)
+        try fm.createDirectory(at: partial, withIntermediateDirectories: true)
+        var weights = model.toTransformers()
+        for (key, value) in discriminator.toTorch() {
+            weights["discriminator." + key] = value
+        }
+        eval(Array(weights.values))
+        try save(arrays: weights, metadata: ["format": "pt"], url: partial.appendingPathComponent("model.safetensors"))
+        for name in vitsCheckpointFiles where name != "model.safetensors" {
+            let from = source.appendingPathComponent(name)
+            guard fm.fileExists(atPath: from.path) else { continue }
+            try fm.copyItem(at: from.resolvingSymlinksInPath(), to: partial.appendingPathComponent(name))
+        }
+        try Data(vitsJSON(["global_step": step]).utf8).write(to: partial.appendingPathComponent("trainer_state.json"))
+        if fm.fileExists(atPath: output.path) {
+            _ = try fm.replaceItemAt(output, withItemAt: partial)
+        } else {
+            try fm.moveItem(at: partial, to: output)
+        }
+    }
+}
+
+/// The steps a run saved in `folder` had taken, or nil when none is there.
+public func vitsCheckpointStep(_ folder: URL) -> Int? {
+    guard let data = try? Data(contentsOf: folder.appendingPathComponent("trainer_state.json")),
+          let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return state["global_step"] as? Int
+}
+
+/// The files of a training checkpoint, the weights and the rest.
+let vitsCheckpointFiles = [
+    "config.json", "model.safetensors", "vocab.json", "tokenizer_config.json", "special_tokens_map.json",
+    "added_tokens.json", "preprocessor_config.json",
+]
+
+extension VitsDiscriminator {
+    /// Its weights in PyTorch's layout: the inverse of
+    /// `sanitize(weights:)`, but with weight norm kept.
+    func toTorch() -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        for (key, value) in parameters().flattened() {
+            switch value.ndim {
+            case 3: out[key] = value.transposed(0, 2, 1)
+            case 4: out[key] = value.transposed(0, 3, 1, 2)
+            default: out[key] = value
+            }
+        }
+        return out
+    }
 }
 
 // MARK: - Loading and saving
 
 public extension VitsModel {
+    /// A training checkpoint, as finetune-hf-vits's
+    /// `convert_original_discriminator_checkpoint.py` makes one but without
+    /// Python: the voice in `voice` and the discriminator Meta published for
+    /// its language (`facebook/mms-tts`, `full_models/<code>/D_100000.pth`),
+    /// together in `output`. `loadForTraining` reads it, as does
+    /// finetune-hf-vits.
+    static func makeTrainingCheckpoint(voice: URL, discriminator: URL, to output: URL) throws {
+        let fm = FileManager.default
+        // Meta's names are finetune-hf-vits's but for `conv_post`, and its
+        // weight norm is folded, as the converter's `remove_weight_norm` does:
+        // training splits it again, from there.
+        let meta = try TorchCheckpoint.tensors(at: discriminator, under: "model")
+        var weights: [String: MLXArray] = [:]
+        for (key, value) in meta where !key.hasSuffix(".weight_g") {
+            let name = "discriminator." + key.replacingOccurrences(of: "conv_post", with: "final_conv")
+            guard key.hasSuffix(".weight_v") else {
+                weights[name] = value
+                continue
+            }
+            guard let g = meta[String(key.dropLast("_v".count)) + "_g"] else {
+                throw VitsError.unsupported("discriminator checkpoint without \(key)'s weight_g")
+            }
+            let norm = sqrt(sum(value * value, axes: Array(1 ..< value.ndim), keepDims: true))
+            weights[String(name.dropLast("_v".count))] = g * value / norm
+        }
+
+        var config = (try JSONSerialization.jsonObject(
+            with: Data(contentsOf: voice.appendingPathComponent("config.json"))) as? [String: Any]) ?? [:]
+        let defaults: [String: Any] = [
+            "discriminator_kernel_size": 5, "discriminator_stride": 3,
+            "discriminator_periods": [2, 3, 5, 7, 11], "discriminator_period_channels": [1, 32, 128, 512, 1024],
+            "discriminator_scale_channels": [1, 16, 64, 256, 1024], "segment_size": 8192, "hop_length": 256,
+        ]
+        config.merge(defaults) { have, _ in have }
+        config["architectures"] = ["VitsModelForPreTraining"]
+        let configText = vitsJSON(config)
+
+        // Its shapes, checked before anything is written.
+        let check = VitsDiscriminator(try JSONDecoder().decode(VitsDiscriminatorConfig.self, from: Data(configText.utf8)))
+        try check.update(parameters: ModuleParameters.unflattened(check.sanitize(weights: weights)), verify: .all)
+
+        for file in try fm.contentsOfDirectory(at: voice, includingPropertiesForKeys: nil)
+        where file.pathExtension == "safetensors" {
+            for (key, value) in try loadArrays(url: file) where !key.hasPrefix("discriminator.") {
+                weights[key] = value
+            }
+        }
+        try fm.createDirectory(at: output, withIntermediateDirectories: true)
+        try save(arrays: weights, metadata: ["format": "pt"], url: output.appendingPathComponent("model.safetensors"))
+        try Data(configText.utf8).write(to: output.appendingPathComponent("config.json"))
+        for name in vitsCheckpointFiles where !["config.json", "model.safetensors"].contains(name) {
+            let from = voice.appendingPathComponent(name)
+            let to = output.appendingPathComponent(name)
+            guard fm.fileExists(atPath: from.path) else { continue }
+            try? fm.removeItem(at: to)
+            try fm.copyItem(at: from.resolvingSymlinksInPath(), to: to)
+        }
+        let rate = config["sampling_rate"] as? Int ?? 16000
+        let features: [String: Any] = [
+            "feature_extractor_type": "VitsFeatureExtractor", "feature_size": 80, "hop_length": 256,
+            "max_wav_value": 32768.0, "n_fft": 1024, "padding_side": "right", "padding_value": 0.0,
+            "return_attention_mask": false, "sampling_rate": rate,
+        ]
+        try Data(vitsJSON(features).utf8).write(to: output.appendingPathComponent("preprocessor_config.json"))
+    }
+
     /// The generator and discriminator from a training checkpoint, ready
     /// to train.
     static func loadForTraining(_ modelDir: URL) throws -> (VitsModel, VitsDiscriminator) {
@@ -826,7 +966,7 @@ public extension VitsModel {
             let to = output.appendingPathComponent(name)
             guard FileManager.default.fileExists(atPath: from.path) else { continue }
             try? FileManager.default.removeItem(at: to)
-            try FileManager.default.copyItem(at: from, to: to)
+            try FileManager.default.copyItem(at: from.resolvingSymlinksInPath(), to: to)
         }
     }
 }

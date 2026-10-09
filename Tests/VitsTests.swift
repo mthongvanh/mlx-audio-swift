@@ -584,6 +584,143 @@ struct VitsFineTuneTests {
     }
 }
 
+// MARK: - PyTorch checkpoints and training checkpoints
+
+/// A checkpoint `torch.save` wrote (torch 2.14): `{"model": OrderedDict,
+/// "iteration", "learning_rate", "optimizer"}`, its archive folder named for
+/// the file, one tensor a view into a larger storage.
+@Suite("VITS PyTorch checkpoints")
+struct VitsTorchCheckpointTests {
+    let url = Bundle.module.url(forResource: "vits_tiny_checkpoint", withExtension: "pth", subdirectory: "media")!
+
+    @Test func readsAStateDict() throws {
+        let tensors = try TorchCheckpoint.tensors(at: url, under: "model")
+        #expect(Set(tensors.keys) == ["convs.0.weight_v", "convs.0.weight_g", "convs.0.bias", "half", "steps", "scalar"])
+        let v = tensors["convs.0.weight_v"]!
+        #expect(v.shape == [2, 3, 2])
+        #expect(v.asArray(Float.self) == (0 ..< 12).map { Float($0) / 4 })
+        #expect(tensors["convs.0.weight_g"]!.shape == [2, 1, 1])
+        // Elements 5 to 7 of a storage of 20.
+        #expect(tensors["convs.0.bias"]!.asArray(Float.self) == [5, 6, 7])
+        #expect(tensors["half"]!.dtype == .float16)
+        #expect(tensors["half"]!.asType(.float32).asArray(Float.self) == [1.5, -2.25])
+        #expect(tensors["steps"]!.asArray(Int64.self) == [7, -1])
+        #expect(tensors["scalar"]!.shape == [])
+        #expect(tensors["scalar"]!.item(Float.self) == 0.5)
+    }
+
+    @Test func readsWhatIsBesideIt() throws {
+        let checkpoint = try TorchCheckpoint(url: url)
+        guard case .int(7693)? = checkpoint.root["iteration"] else {
+            Issue.record("iteration")
+            return
+        }
+        guard case .float(let rate)? = checkpoint.root["learning_rate"] else {
+            Issue.record("learning_rate")
+            return
+        }
+        #expect(rate == 0.0002)
+    }
+
+    @Test func refusesWhatIsNotOne() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("not-a-checkpoint.pth")
+        try Data("not a zip at all, not even close to one".utf8).write(to: file)
+        #expect(throws: TorchCheckpoint.ReadError.self) { try TorchCheckpoint.tensors(at: file) }
+    }
+}
+
+private let metaDiscriminator = ProcessInfo.processInfo.environment["VITS_META_DISCRIMINATOR"]
+
+/// A training checkpoint made here from the voice (VITS_PARITY_MODEL) and
+/// Meta's discriminator for it (VITS_META_DISCRIMINATOR, `D_100000.pth`),
+/// against the one finetune-hf-vits's converter made
+/// (VITS_PARITY_TRAIN_MODEL); and a run saved part way, read back.
+@Suite(
+    "VITS training checkpoints",
+    .serialized,
+    .enabled(
+        if: metaDiscriminator != nil && parityModel != nil && trainModel != nil,
+        "set VITS_META_DISCRIMINATOR, VITS_PARITY_MODEL and VITS_PARITY_TRAIN_MODEL")
+)
+struct VitsTrainingCheckpointTests {
+    @Test func madeAsTheConverterMakesIt() throws {
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("vits-train-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: output) }
+        try VitsModel.makeTrainingCheckpoint(
+            voice: URL(fileURLWithPath: parityModel!), discriminator: URL(fileURLWithPath: metaDiscriminator!),
+            to: output)
+
+        let made = try loadArrays(url: output.appendingPathComponent("model.safetensors"))
+        // The converter's transformers writes weight norm by PyTorch's newer
+        // names; the voice, and so this, by the older ones.
+        let converted = Dictionary(
+            uniqueKeysWithValues: try loadArrays(
+                url: URL(fileURLWithPath: trainModel!).appendingPathComponent("model.safetensors")
+            ).map { key, value in
+                (
+                    key.replacingOccurrences(of: ".parametrizations.weight.original0", with: ".weight_g")
+                        .replacingOccurrences(of: ".parametrizations.weight.original1", with: ".weight_v"),
+                    value
+                )
+            })
+        #expect(Set(made.keys) == Set(converted.keys))
+        var worst: Float = 0
+        for (key, value) in converted {
+            guard let mine = made[key], mine.shape == value.shape else {
+                Issue.record("\(key): \(made[key]?.shape ?? []) vs \(value.shape)")
+                continue
+            }
+            worst = max(worst, abs(mine.asType(.float32) - value.asType(.float32)).max().item(Float.self))
+        }
+        print("VITS training checkpoint  largest difference from the converter's: \(worst)")
+        #expect(worst <= 1e-6)
+
+        // It loads to train.
+        let (_, discriminator) = try VitsModel.loadForTraining(output)
+        #expect(discriminator.discriminators.count == 6)
+    }
+
+    @Test func aRunSavedPartWayReadsBack() throws {
+        let source = URL(fileURLWithPath: trainModel!)
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("vits-run-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: output) }
+        let (model, discriminator) = try VitsModel.loadForTraining(source)
+        var config = VitsTrainingConfig()
+        config.batchSize = 2
+        let trainer = VitsTrainer(model: model, discriminator: discriminator, config: config)
+        MLXRandom.seed(1)
+        // Two clips the voice makes itself, and a step on them, so the
+        // weights are no longer the source's.
+        model.train(false)
+        var clips: [VitsTrainingClip] = []
+        for text in ["té pang 'chạu ê sa", "'tan chảu chắng bók sau 'va 'má 'toi"] {
+            let ids = MLXArray(try model.tokenizer!.encode(text).map(Int32.init)).reshaped(1, -1)
+            let (waveform, lengths) = model(ids)
+            let audio = waveform[0, 0 ..< lengths[0].item(Int.self)]
+            clips.append(try #require(try trainer.clip(name: text, audio: audio, text: text)))
+        }
+        model.train(true)
+        trainer.train(clips, maxSteps: 1)
+        try trainer.saveCheckpoint(from: source, to: output, step: 1)
+        // Saved again, replacing the first.
+        try trainer.saveCheckpoint(from: source, to: output, step: 1)
+        #expect(vitsCheckpointStep(output) == 1)
+        #expect(vitsCheckpointStep(source) == nil)
+
+        let (again, againDiscriminator) = try VitsModel.loadForTraining(output)
+        func same(_ a: Module, _ b: Module) -> Bool {
+            let theirs = Dictionary(uniqueKeysWithValues: b.parameters().flattened())
+            return a.parameters().flattened().allSatisfy { key, value in
+                theirs[key].map { $0.shape == value.shape && allClose($0, value, rtol: 0, atol: 0).item(Bool.self) } ?? false
+            }
+        }
+        #expect(same(model, again))
+        #expect(same(discriminator, againDiscriminator))
+        let (fresh, _) = try VitsModel.loadForTraining(source)
+        #expect(!same(model, fresh))
+    }
+}
+
 @Suite("VITS config JSON")
 struct VitsJSONTests {
     @Test func floatsStayFloats() throws {

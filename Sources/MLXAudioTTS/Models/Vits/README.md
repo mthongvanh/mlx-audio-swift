@@ -37,18 +37,27 @@ phonemised text need that done first.
 A port of the Python port's trainer, itself
 [finetune-hf-vits](https://github.com/ylacombe/finetune-hf-vits) (MIT) step for step:
 the same losses and weights, discriminator then generator, AdamW with PyTorch's
-defaults, the learning rate decayed once an epoch. It needs a checkpoint carrying the
-discriminator, as finetune-hf-vits's `convert_original_discriminator_checkpoint.py`
-makes (it needs PyTorch, once per language).
+defaults, the learning rate decayed once an epoch. It needs a training checkpoint, the
+voice with its discriminator. `makeTrainingCheckpoint` makes one, without Python, from
+the voice and the discriminator Meta published for its language (`facebook/mms-tts`,
+`full_models/<code>/D_100000.pth`, about 560 MB), as finetune-hf-vits's
+`convert_original_discriminator_checkpoint.py` does.
 
 ```swift
+try VitsModel.makeTrainingCheckpoint(voice: voiceFolder, discriminator: pth, to: checkpoint)
 let (model, discriminator) = try VitsModel.loadForTraining(checkpoint)
 let trainer = VitsTrainer(model: model, discriminator: discriminator, config: VitsTrainingConfig())
 let clips = try trainer.loadClips(folder: data)  // clips and a metadata.jsonl of {"file_name", "text"}
-trainer.train(clips) { epoch, step, losses in print(step, losses.total); return true }
+trainer.train(clips, maxSteps: 500) { epoch, step, losses in print(step, losses.total); return true }
 try model.saveTrained(from: checkpoint, to: output)
 ```
 
+- `makeTrainingCheckpoint` reads the `.pth` with a small reader of PyTorch's zip
+  checkpoints (`TorchCheckpoint`): state dicts of tensors, with nothing in the file run.
+  Made from `blt`'s, it matches the converter's within 4.8e-7.
+- A run saved part way (`trainer.saveCheckpoint(from:to:step:)`, weight norm kept)
+  loads with `loadForTraining`, and `train(_:maxSteps:startingAt:)` carries it on from
+  its epoch (`vitsCheckpointStep`). The optimisers start afresh.
 - `trainer.clip(name:audio:text:)` makes a clip from audio already in hand.
 - `saveTrained` writes a plain transformers checkpoint (weight norm folded, no
   discriminator): it loads here, in the Python port, and in transformers 4.46 and 5.19.
